@@ -176,7 +176,22 @@ function pill(f) {
 
 // -------------------------------------------------------------------- charts
 const charts = {};
+
+// Rehace el tamaño y el trazado de todos los gráficos vivos. Se llama al volver
+// a la pestaña: un canvas de Chart.js dibujado mientras la pestaña estaba en
+// segundo plano se queda en blanco (requestAnimationFrame no corre en tabs
+// ocultas y el ResizeObserver puede no dispararse al volver), así que hay que
+// forzar el resize + redraw a mano cuando la pestaña vuelve a estar visible.
+function redibujarGraficos() {
+  for (const c of Object.values(charts)) {
+    if (!c) continue;
+    try { c.resize(); c.update("none"); } catch (_) { /* chart ya destruido */ }
+  }
+}
+
 function dibujar(id, filas) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
   const f = filas[filas.length - 1];
   const labels = filas.map(r => fmtNY(r.ts_registro_utc));
   const ds = [];
@@ -230,8 +245,12 @@ function dibujar(id, filas) {
       },
     },
   };
-  if (charts[id]) { charts[id].data = cfg.data; charts[id].options = cfg.options; charts[id].update(); }
-  else charts[id] = new Chart(document.getElementById(id), cfg);
+  // `cargar()` reescribe el innerHTML de #cards en cada refresco, así que el
+  // canvas anterior queda desconectado del DOM. Reutilizar la instancia vieja
+  // dibujaría sobre ese canvas huérfano (gráfico en blanco); por eso destruimos
+  // y recreamos sobre el canvas nuevo.
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(canvas, cfg);
 }
 
 // --------------------------------------------------------------------- render
@@ -314,8 +333,16 @@ async function entrar(passphrase) {
     document.getElementById("gate").hidden = true;
     document.getElementById("app").hidden = false;
     await cargar();
-    setInterval(cargar, REFRESH_MS);
-    document.addEventListener("visibilitychange", () => { if (!document.hidden) cargar(); });
+    // No refrescamos mientras la pestaña está oculta: crear/actualizar un chart
+    // en una tab en segundo plano es justo lo que lo deja en blanco.
+    setInterval(() => { if (!document.hidden) cargar(); }, REFRESH_MS);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) return;
+      // 1) redibujo inmediato de los canvas que quedaron en blanco (sin red).
+      requestAnimationFrame(redibujarGraficos);
+      // 2) y además refrescamos los datos.
+      cargar();
+    });
   } catch (e) {
     SB = null;
     errEl.textContent = (e.message === "no-config")
