@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Generar config.enc</title>
+<!--
+  HERRAMIENTA LOCAL. No se sube al repo público (o si se sube, da igual: no
+  contiene ningún secreto). Se abre en el navegador, se completan los 3 campos,
+  y devuelve el contenido de `config.enc` para guardar junto a index.html.
+
+  El cifrado tiene que coincidir EXACTAMENTE con el de index.html:
+  PBKDF2(passphrase, salt, 200000, SHA-256) -> AES-GCM-256.
+-->
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  label { display: block; margin: 14px 0 4px; font-weight: 600; }
+  input { width: 100%; padding: 8px; }
+  button { margin-top: 16px; padding: 9px 16px; font-weight: 700; cursor: pointer; }
+  textarea { width: 100%; height: 140px; margin-top: 14px; font-family: monospace; }
+  .hint { color: #666; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>Generar <code>config.enc</code></h1>
+<p class="hint">Todo pasa en tu navegador. Nada se envía a ningún lado.</p>
+
+<label>SUPABASE_URL</label>
+<input id="url" placeholder="https://xxxxxxxx.supabase.co">
+<div class="hint">Supabase → Project Settings → API → "Project URL".</div>
+
+<label>anon key (NO la service_role)</label>
+<input id="key" placeholder="eyJhbGciOi...">
+<div class="hint">Supabase → Project Settings → API → Project API keys → <b>anon / public</b>.</div>
+
+<label>Contraseña del panel</label>
+<input id="pass" type="text" placeholder="la que vas a compartir para entrar al panel">
+
+<button id="go">Generar</button>
+
+<textarea id="out" readonly placeholder="acá aparece el contenido de config.enc"></textarea>
+<button id="dl" disabled>Descargar config.enc</button>
+
+<script>
+"use strict";
+const enc = new TextEncoder();
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+async function deriveKey(passphrase, salt) {
+  const base = await crypto.subtle.importKey("raw", enc.encode(passphrase),
+    { name: "PBKDF2" }, false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 200000, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+}
+
+document.getElementById("go").addEventListener("click", async () => {
+  const url = document.getElementById("url").value.trim().replace(/\/+$/, "");
+  const key = document.getElementById("key").value.trim();
+  const pass = document.getElementById("pass").value;
+  if (!url || !key || !pass) { alert("Completá los 3 campos."); return; }
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await deriveKey(pass, salt);
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey,
+    enc.encode(JSON.stringify({ supabase_url: url, anon_key: key })));
+
+  const blob = { v: 1, salt: b64(salt), iv: b64(iv), ct: b64(ct) };
+  const txt = JSON.stringify(blob, null, 2);
+  document.getElementById("out").value = txt;
+
+  const dl = document.getElementById("dl");
+  dl.disabled = false;
+  dl.onclick = () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([txt], { type: "application/json" }));
+    a.download = "config.enc";
+    a.click();
+  };
+});
+</script>
+</body>
+</html>

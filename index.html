@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SISTEMA_NUEVO · Estado de señal</title>
+<!--
+  Panel de SOLO LECTURA del estado de la señal de SISTEMA_NUEVO.
+  - Lee de Supabase (tablas `estado_senal` y `heartbeats`) con la anon key.
+  - La anon key + URL de Supabase viven CIFRADAS en `config.enc`; se descifran
+    en el navegador con la contraseña (Web Crypto, AES-GCM + PBKDF2).
+  - NUNCA escribe nada. NUNCA habla con los procesos de producción ni con MT5.
+  Diseño: SISTEMA_NUEVO/docs/DISENO_PANEL_VISUAL.md
+-->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1116; --card: #181b22; --ink: #e6e8ec; --muted: #9aa3b2;
+    --line: #272b34; --ok: #2ecc71; --warn: #f1c40f; --bad: #e74c3c; --accent: #5dade2;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 14px 16px; border-bottom: 1px solid var(--line);
+           display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .upd { color: var(--muted); font-size: 12px; }
+  #banner { display: none; background: var(--bad); color: #fff; padding: 10px 16px;
+            font-weight: 600; }
+  main { padding: 16px; display: grid; gap: 16px;
+         grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px; }
+  .card h2 { font-size: 14px; margin: 0 0 2px; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+          font-weight: 600; margin-left: 6px; }
+  .pill.ok { background: rgba(46,204,113,.15); color: var(--ok); }
+  .pill.warn { background: rgba(241,196,15,.15); color: var(--warn); }
+  .pill.pos { background: rgba(93,173,226,.18); color: var(--accent); }
+  .chartwrap { position: relative; height: 230px; margin: 6px 0 10px; }
+  .readout { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px;
+             color: var(--muted); margin-bottom: 8px; }
+  .readout b { color: var(--ink); font-weight: 600; }
+  .frase { font-size: 13px; padding: 8px 10px; background: #12151c; border-radius: 8px;
+           border: 1px solid var(--line); }
+  .frase .verdict-CERCA { color: var(--warn); font-weight: 700; }
+  .frase .verdict-LEJOS { color: var(--muted); font-weight: 700; }
+  .foot { padding: 8px 16px 20px; color: var(--muted); font-size: 11px; }
+  /* gate de contraseña */
+  #gate { max-width: 320px; margin: 12vh auto; padding: 20px; background: var(--card);
+          border: 1px solid var(--line); border-radius: 10px; text-align: center; }
+  #gate input { width: 100%; padding: 9px; margin: 10px 0; background: #0f1116;
+                border: 1px solid var(--line); border-radius: 6px; color: var(--ink); }
+  #gate button { width: 100%; padding: 9px; background: var(--accent); border: 0;
+                 border-radius: 6px; color: #04121c; font-weight: 700; cursor: pointer; }
+  #gate .err { color: var(--bad); font-size: 12px; min-height: 16px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <div style="font-weight:600">SISTEMA_NUEVO · panel</div>
+  <input id="pass" type="password" placeholder="Contraseña" autocomplete="current-password">
+  <button id="unlock">Entrar</button>
+  <div class="err" id="gate-err"></div>
+</div>
+
+<div id="app" hidden>
+  <div id="banner"></div>
+  <header>
+    <h1>SISTEMA_NUEVO · Estado de señal</h1>
+    <span class="upd" id="updated">cargando…</span>
+  </header>
+  <main id="cards"></main>
+  <div class="foot">
+    Panel informativo de solo lectura. No ejecuta ni modifica nada.
+    Se actualiza cada 2 min. Un panel viejo NO significa que el sistema esté bien —
+    verificar siempre en la MiniPC / Telegram ante datos rancios.
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ------------------------------------------------------------------ config
+const REFRESH_MS = 120000;          // 2 min
+const FILAS_POR_ACTIVO = 150;       // ~6 días de velas H1
+const HEARTBEAT_RANCIO_MS = 5 * 60 * 1000;
+const ESTADO_RANCIO_MS   = 90 * 60 * 1000;
+const NY = "America/New_York";
+
+let SB = null;   // { url, key }  -- se llena tras descifrar config.enc
+
+// ------------------------------------------------------------ cripto (gate)
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const b64d = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+async function deriveKey(passphrase, salt) {
+  const base = await crypto.subtle.importKey("raw", enc.encode(passphrase),
+    { name: "PBKDF2" }, false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 200000, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+}
+
+async function decryptConfig(passphrase) {
+  const res = await fetch("config.enc", { cache: "no-store" });
+  if (!res.ok) throw new Error("no-config");
+  const blob = await res.json();               // { v, salt, iv, ct }  (base64)
+  const key = await deriveKey(passphrase, b64d(blob.salt));
+  const plain = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: b64d(blob.iv) }, key, b64d(blob.ct));
+  return JSON.parse(dec.decode(plain));         // { supabase_url, anon_key }
+}
+
+// ------------------------------------------------------------- Supabase read
+async function sbGet(path) {
+  const r = await fetch(`${SB.url}/rest/v1/${path}`, {
+    headers: { apikey: SB.key, Authorization: `Bearer ${SB.key}` },
+    cache: "no-store",
+  });
+  if (!r.ok) throw new Error(`Supabase ${r.status}`);
+  return r.json();
+}
+
+// ---------------------------------------------------------------- utilidades
+const fmtNY = ts => new Date(ts).toLocaleString("es-AR",
+  { timeZone: NY, day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+const hace = ms => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s} s`;
+  const m = Math.round(s / 60);
+  return m < 90 ? `${m} min` : `${Math.round(m / 60)} h`;
+};
+const num = (v, d = 2) => (v == null || Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
+
+// ------------------------------------------------------------------ veredicto
+function veredicto(f) {
+  if (f.decision_accion && f.decision_accion !== "mantener") return "CERCA";
+  if (f.tipo_senal === "tendencia") {
+    const acerca = f.sma_dist != null && f.sma_dist_prev != null
+      && Math.abs(f.sma_dist) < Math.abs(f.sma_dist_prev);
+    if (acerca && f.adx != null && f.adx_umbral != null && f.adx >= f.adx_umbral - 3) return "CERCA";
+  } else {
+    if (f.zscore != null && f.z_umbral != null && Math.abs(f.zscore) >= f.z_umbral - 0.5
+        && f.adx != null && f.adx_umbral != null && f.adx < f.adx_umbral) return "CERCA";
+  }
+  return "LEJOS";
+}
+
+function frase(f) {
+  const v = veredicto(f);
+  const tag = `<span class="verdict-${v}">${v} de señal</span>`;
+  if (f.tipo_senal === "tendencia") {
+    const d = f.sma_dist, dp = f.sma_dist_prev;
+    const mov = (d != null && dp != null)
+      ? (Math.abs(d) < Math.abs(dp) ? "acercándose" : "separándose") : "—";
+    return `Las medias rápida/lenta están a <b>${num(Math.abs(d))}</b> de cruzarse y ${mov}; `
+         + `el ADX está en <b>${num(f.adx, 1)}</b> (necesita ≥ ${num(f.adx_umbral, 0)}). → ${tag}.`;
+  }
+  const z = f.zscore, zt = f.z_umbral;
+  const falta = (z != null && zt != null) ? num(zt - Math.abs(z)) : "—";
+  return `El precio está a <b>${num(Math.abs(z))} σ</b> de su media (${falta} σ para tocar la banda ±${num(zt, 1)}); `
+       + `el ADX está en <b>${num(f.adx, 1)}</b> (necesita &lt; ${num(f.adx_umbral, 0)}). → ${tag}.`;
+}
+
+function pill(f) {
+  if (f.pausado_desempeno) return `<span class="pill warn">⏸ PAUSADO por desempeño</span>`;
+  if (f.en_posicion) return `<span class="pill pos">📊 en posición ${(f.lado_posicion || "").toUpperCase()}</span>`;
+  return `<span class="pill ok">🟢 operando · flat</span>`;
+}
+
+// -------------------------------------------------------------------- charts
+const charts = {};
+function dibujar(id, filas) {
+  const f = filas[filas.length - 1];
+  const labels = filas.map(r => fmtNY(r.ts_registro_utc));
+  const ds = [];
+  const anns = {};
+
+  if (f.tipo_senal === "tendencia") {
+    ds.push({ label: "precio", data: filas.map(r => r.close), yAxisID: "y",
+              borderColor: "#e6e8ec", borderWidth: 1.4, pointRadius: 0, tension: .15 });
+    ds.push({ label: "SMA rápida", data: filas.map(r => r.sma_rapida), yAxisID: "y",
+              borderColor: "#5dade2", borderWidth: 1.2, pointRadius: 0 });
+    ds.push({ label: "SMA lenta", data: filas.map(r => r.sma_lenta), yAxisID: "y",
+              borderColor: "#af7ac5", borderWidth: 1.2, pointRadius: 0 });
+    ds.push({ label: "ADX", data: filas.map(r => r.adx), yAxisID: "y1",
+              borderColor: "#f1c40f", borderWidth: 1.2, pointRadius: 0, borderDash: [4, 3] });
+    if (f.adx_umbral != null) anns.adx = { type: "line", yScaleID: "y1", yMin: f.adx_umbral,
+      yMax: f.adx_umbral, borderColor: "#f1c40f", borderWidth: 1, borderDash: [2, 2],
+      label: { display: true, content: `ADX ${f.adx_umbral}`, position: "start",
+               font: { size: 9 }, color: "#f1c40f", backgroundColor: "transparent" } };
+  } else {
+    ds.push({ label: "precio", data: filas.map(r => r.close), yAxisID: "y",
+              borderColor: "#e6e8ec", borderWidth: 1.4, pointRadius: 0, tension: .15 });
+    ds.push({ label: "z-score", data: filas.map(r => r.zscore), yAxisID: "y1",
+              borderColor: "#5dade2", borderWidth: 1.4, pointRadius: 0 });
+    const zt = f.z_umbral;
+    if (zt != null) {
+      for (const [k, val, col] of [["zp", zt, "#e74c3c"], ["zn", -zt, "#2ecc71"], ["z0", 0, "#5b6472"]]) {
+        anns[k] = { type: "line", yScaleID: "y1", yMin: val, yMax: val, borderColor: col,
+                    borderWidth: 1, borderDash: [2, 2] };
+      }
+    }
+  }
+
+  const cfg = {
+    type: "line",
+    data: { labels, datasets: ds },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { labels: { color: "#9aa3b2", boxWidth: 10, font: { size: 10 } } },
+        annotation: { annotations: anns },
+        tooltip: { titleFont: { size: 10 }, bodyFont: { size: 10 } },
+      },
+      scales: {
+        x: { ticks: { color: "#5b6472", maxTicksLimit: 6, font: { size: 9 } },
+             grid: { color: "#1e222b" } },
+        y: { position: "left", ticks: { color: "#9aa3b2", font: { size: 9 } },
+             grid: { color: "#1e222b" } },
+        y1: { position: "right", ticks: { color: "#f1c40f", font: { size: 9 } },
+              grid: { drawOnChartArea: false } },
+      },
+    },
+  };
+  if (charts[id]) { charts[id].data = cfg.data; charts[id].options = cfg.options; charts[id].update(); }
+  else charts[id] = new Chart(document.getElementById(id), cfg);
+}
+
+// --------------------------------------------------------------------- render
+function tarjeta(simbolo, filas, hb) {
+  const f = filas[filas.length - 1];
+  const tipo = f.tipo_senal === "tendencia" ? "tendencia" : "reversión";
+  const readout = f.tipo_senal === "tendencia"
+    ? `<span>SMA rápida <b>${num(f.sma_rapida)}</b></span>
+       <span>SMA lenta <b>${num(f.sma_lenta)}</b></span>
+       <span>distancia <b>${num(f.sma_dist)}</b></span>
+       <span>ADX <b>${num(f.adx, 1)}</b> / ${num(f.adx_umbral, 0)}</span>
+       <span>cruce reciente: <b>${f.cruce_reciente_dir
+          ? `${f.cruce_reciente_dir}, hace ${f.cruce_reciente_hace} vela(s)` : "ninguno (24 velas)"}</b></span>`
+    : `<span>z-score <b>${num(f.zscore)}</b> / ±${num(f.z_umbral, 1)}</span>
+       <span>ADX <b>${num(f.adx, 1)}</b> / &lt; ${num(f.adx_umbral, 0)}</span>`;
+  const hbAge = hb ? hace(Date.now() - new Date(hb).getTime()) : "—";
+  return `
+    <div class="card">
+      <h2>${simbolo} · ${tipo} H1 ${pill(f)}</h2>
+      <div class="sub">vela: ${fmtNY(f.ts_registro_utc)} NY · señal de vida: ${hbAge}</div>
+      <div class="chartwrap"><canvas id="ch-${simbolo}"></canvas></div>
+      <div class="readout">${readout}</div>
+      <div class="frase">${frase(f)}</div>
+    </div>`;
+}
+
+async function cargar() {
+  try {
+    const [xau, us, hbs] = await Promise.all([
+      sbGet(`estado_senal?simbolo=eq.XAUUSD&order=ts_registro_utc.desc&limit=${FILAS_POR_ACTIVO}`),
+      sbGet(`estado_senal?simbolo=eq.US2000&order=ts_registro_utc.desc&limit=${FILAS_POR_ACTIVO}`),
+      sbGet(`heartbeats?select=magic,simbolo,ts_utc`),
+    ]);
+    const cont = document.getElementById("cards");
+    const hbBy = Object.fromEntries(hbs.map(h => [h.simbolo, h.ts_utc]));
+    const bloques = [];
+    for (const [sim, rows] of [["XAUUSD", xau], ["US2000", us]]) {
+      if (!rows.length) { bloques.push(`<div class="card"><h2>${sim}</h2>
+        <div class="sub">sin datos todavía — el panel se llena cuando los runners escriban la primera vela.</div></div>`);
+        continue; }
+      rows.reverse();                       // a orden cronológico para el gráfico
+      bloques.push(tarjeta(sim, rows, hbBy[sim]));
+    }
+    cont.innerHTML = bloques.join("");
+    for (const [sim, rows] of [["XAUUSD", xau], ["US2000", us]]) {
+      if (rows.length) dibujar(`ch-${sim}`, rows);   // xau/us ya vienen reversed
+    }
+
+    // frescura
+    const ahora = Date.now();
+    const hbNuevo = hbs.length ? Math.max(...hbs.map(h => new Date(h.ts_utc).getTime())) : 0;
+    const esNuevo = Math.max(
+      ...xau.concat(us).map(r => new Date(r.ts_registro_utc).getTime()), 0);
+    const banner = document.getElementById("banner");
+    const viejoHb = !hbNuevo || (ahora - hbNuevo) > HEARTBEAT_RANCIO_MS;
+    const viejoEs = !esNuevo || (ahora - esNuevo) > ESTADO_RANCIO_MS;
+    if (viejoHb || viejoEs) {
+      banner.style.display = "block";
+      banner.textContent = `⚠️ Sin datos frescos hace `
+        + `${hace(ahora - Math.max(hbNuevo, esNuevo))} — puede que los procesos estén caídos. `
+        + `Verificar en la MiniPC / Telegram.`;
+    } else banner.style.display = "none";
+
+    document.getElementById("updated").textContent =
+      `actualizado ${new Date().toLocaleTimeString("es-AR", { timeZone: NY })} NY`;
+  } catch (e) {
+    document.getElementById("updated").textContent = `error al cargar: ${e.message}`;
+  }
+}
+
+// ----------------------------------------------------------------- arranque
+async function entrar(passphrase) {
+  const errEl = document.getElementById("gate-err");
+  errEl.textContent = "";
+  try {
+    SB = { url: null, key: null };
+    const c = await decryptConfig(passphrase);
+    SB = { url: c.supabase_url.replace(/\/+$/, ""), key: c.anon_key };
+    sessionStorage.setItem("sn_pass", passphrase);
+    document.getElementById("gate").hidden = true;
+    document.getElementById("app").hidden = false;
+    await cargar();
+    setInterval(cargar, REFRESH_MS);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) cargar(); });
+  } catch (e) {
+    SB = null;
+    errEl.textContent = (e.message === "no-config")
+      ? "Falta config.enc en el repo (ver README)."
+      : "Contraseña incorrecta.";
+  }
+}
+
+document.getElementById("unlock").addEventListener("click",
+  () => entrar(document.getElementById("pass").value));
+document.getElementById("pass").addEventListener("keydown",
+  e => { if (e.key === "Enter") entrar(e.target.value); });
+
+const guardada = sessionStorage.getItem("sn_pass");
+if (guardada) entrar(guardada);
+</script>
+</body>
+</html>
