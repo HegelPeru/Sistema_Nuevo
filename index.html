@@ -91,6 +91,11 @@ const FILAS_POR_ACTIVO = 150;       // ~6 días de velas H1
 const HEARTBEAT_RANCIO_MS = 5 * 60 * 1000;
 const ESTADO_RANCIO_MS   = 90 * 60 * 1000;
 const NY = "America/New_York";
+// Ventana en la que NO se espera una fila nueva de estado_senal (minutos desde las
+// 00:00 de Nueva York, con su cambio de horario): el mercado cierra a las 17:00 y la
+// primera vela H1 de la sesión siguiente recién cierra a las 19:00.
+const PAUSA_VELA_INI_MIN = 17 * 60;        // lun–jue 17:00 NY · viernes 17:00 NY
+const PAUSA_VELA_FIN_MIN = 19 * 60 + 15;   // lun–jue 19:15 NY · domingo 19:15 NY
 
 let SB = null;   // { url, key }  -- se llena tras descifrar config.enc
 
@@ -137,6 +142,47 @@ const hace = ms => {
   return m < 90 ? `${m} min` : `${Math.round(m / 60)} h`;
 };
 const num = (v, d = 2) => (v == null || Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
+
+// Día de la semana (0 = domingo … 6 = sábado) y minutos desde las 00:00, en hora de
+// Nueva York. Intl resuelve el cambio de horario de EE.UU.; no hay desfase fijo.
+const DIAS_NY = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const fmtPartesNY = new Intl.DateTimeFormat("en-US",
+  { timeZone: NY, weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+function relojNY(ms) {
+  const p = Object.fromEntries(fmtPartesNY.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+  return { dia: DIAS_NY.indexOf(p.weekday), min: Number(p.hour) * 60 + Number(p.minute) };
+}
+
+// ¿Corresponde exigir una fila fresca de estado_senal en este instante? No de lunes a
+// jueves de 17:00 a 19:15 NY (pausa diaria) ni de viernes 17:00 a domingo 19:15 NY.
+function seEsperaVela(ms) {
+  const { dia, min } = relojNY(ms);
+  if (dia === 6) return false;                           // sábado
+  if (dia === 5) return min < PAUSA_VELA_INI_MIN;        // viernes: hasta las 17:00
+  if (dia === 0) return min >= PAUSA_VELA_FIN_MIN;       // domingo: desde las 19:15
+  return !(min >= PAUSA_VELA_INI_MIN && min < PAUSA_VELA_FIN_MIN);
+}
+
+// Fuentes viejas, una entrada por sistema y fuente: [{ sistema, fuente, texto }].
+// `sistemas` = [[simbolo, filas de estado_senal], …]; `latidos` = { simbolo: ts_utc }.
+// El latido se exige siempre (los procesos ciclan aunque el mercado esté cerrado); la
+// vela, solo cuando el mercado debería estar entregando velas.
+function frescura(ahora, sistemas, latidos) {
+  const viejas = [];
+  const esperaVela = seEsperaVela(ahora);
+  for (const [sim, filas] of sistemas) {
+    const hb = latidos[sim] ? new Date(latidos[sim]).getTime() : 0;
+    if (!hb) viejas.push({ sistema: sim, fuente: "latido", texto: `${sim}: sin latido registrado` });
+    else if (ahora - hb > HEARTBEAT_RANCIO_MS)
+      viejas.push({ sistema: sim, fuente: "latido", texto: `${sim}: latido de hace ${hace(ahora - hb)}` });
+    if (!esperaVela) continue;
+    const vela = Math.max(0, ...filas.map(r => new Date(r.ts_registro_utc).getTime()));
+    if (!vela) viejas.push({ sistema: sim, fuente: "vela", texto: `${sim}: sin velas registradas` });
+    else if (ahora - vela > ESTADO_RANCIO_MS)
+      viejas.push({ sistema: sim, fuente: "vela", texto: `${sim}: vela de hace ${hace(ahora - vela)}` });
+  }
+  return viejas;
+}
 
 // ------------------------------------------------------------------ veredicto
 function veredicto(f) {
@@ -299,18 +345,17 @@ async function cargar() {
       if (rows.length) dibujar(`ch-${sim}`, rows);   // xau/us ya vienen reversed
     }
 
-    // frescura
+    // frescura, POR SISTEMA: cada activo corre en su propio proceso, así que uno puede
+    // estar caído con el otro sano.
     const ahora = Date.now();
-    const hbNuevo = hbs.length ? Math.max(...hbs.map(h => new Date(h.ts_utc).getTime())) : 0;
-    const esNuevo = Math.max(
-      ...xau.concat(us).map(r => new Date(r.ts_registro_utc).getTime()), 0);
     const banner = document.getElementById("banner");
-    const viejoHb = !hbNuevo || (ahora - hbNuevo) > HEARTBEAT_RANCIO_MS;
-    const viejoEs = !esNuevo || (ahora - esNuevo) > ESTADO_RANCIO_MS;
-    if (viejoHb || viejoEs) {
+    const viejas = frescura(ahora, [["XAUUSD", xau], ["US2000", us]], hbBy);
+    if (viejas.length) {
       banner.style.display = "block";
-      banner.textContent = `⚠️ Sin datos frescos hace `
-        + `${hace(ahora - Math.max(hbNuevo, esNuevo))} — puede que los procesos estén caídos. `
+      banner.textContent = `⚠️ Dato viejo — ${viejas.map(v => v.texto).join(" · ")}. `
+        + (viejas.some(v => v.fuente === "latido")
+            ? `Puede que ese proceso esté caído. `
+            : `El proceso late pero no llegan velas nuevas. `)
         + `Verificar en la MiniPC / Telegram.`;
     } else banner.style.display = "none";
 
